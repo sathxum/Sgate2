@@ -1,0 +1,120 @@
+name: Silence Gateway Deployment (Cloudflare Tunnel)
+
+on: 
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    env:
+      ADMIN_EMAIL: "sinketme@sinket.ai"
+      ADMIN_PASSWORD: "vN7#qL2!xR9@kT4$zP8&"
+    
+    steps:
+    - name: Preflight Checks (Docker, Compose, Sudo, Port)
+      run: |
+        echo "========================================================"
+        echo "   SILENCE GATEWAY // SELF-HOSTED LLM GATEWAY"
+        echo "========================================================"
+        echo "[INFO] Docker:"
+        docker --version
+        echo "[INFO] Docker Compose:"
+        docker compose version
+        if ! sudo -n true 2>/dev/null; then
+          echo "[ERROR] passwordless sudo not available on runner"
+          exit 1
+        fi
+        echo "[OK] passwordless sudo available"
+        if ss -tln 2>/dev/null | grep -q ':8000'; then
+          echo "[ERROR] port 8000 already in use - Silence Gateway needs it on 127.0.0.1"
+          exit 1
+        fi
+        echo "[OK] port 8000 free (gateway binds to 127.0.0.1 only)"
+        echo "[INFO] Disk free:"
+        df -BG --output=avail / | tail -1
+
+    - name: Fetch Official Installer (from sathxum/silence-gateway)
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/sathxum/silence-gateway/main/install.sh -o /tmp/sg-install.sh
+        wc -l /tmp/sg-install.sh
+        head -8 /tmp/sg-install.sh
+        echo "[OK] installer downloaded ($(wc -l < /tmp/sg-install.sh) lines)"
+
+    - name: Deploy Silence Gateway (13-Stage Installer, Non-Interactive)
+      run: |
+        set -o pipefail
+        # Mask the admin password in ALL job logs (safety first)
+        echo "::add-mask::$ADMIN_PASSWORD"
+        # Pre-validate credentials EXACTLY like the installer does,
+        # so its 3 stdin reads succeed on the first attempt.
+        if ! printf '%s' "$ADMIN_EMAIL" | grep -qE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; then
+          echo "[ERROR] ADMIN_EMAIL is not a valid email address"
+          exit 1
+        fi
+        if [ "${#ADMIN_PASSWORD}" -lt 12 ] \
+           || ! printf '%s' "$ADMIN_PASSWORD" | grep -q '[A-Z]' \
+           || ! printf '%s' "$ADMIN_PASSWORD" | grep -q '[a-z]' \
+           || ! printf '%s' "$ADMIN_PASSWORD" | grep -q '[0-9]'; then
+          echo "[ERROR] ADMIN_PASSWORD too weak - needs 12+ chars with UPPER + lower + digit"
+          exit 1
+        fi
+        echo "[INFO] Feeding admin credentials to installer via stdin (non-interactive CI mode)..."
+        echo "[INFO] Installer reads: email (read -r), password + confirm (read -rs)"
+        printf '%s\n%s\n%s\n' "$ADMIN_EMAIL" "$ADMIN_PASSWORD" "$ADMIN_PASSWORD" \
+          | sudo bash /tmp/sg-install.sh 2>&1 \
+          | python3 -c 'import sys,os; pw=os.environ.get("ADMIN_PASSWORD",""); data=sys.stdin.read(); sys.stdout.write(data.replace(pw, "********") if pw else data)'
+        echo "[SUCCESS] Installer completed - Silence Gateway stack is up"
+
+    - name: Capture Tunnel URL + Publish Public Summary
+      run: |
+        TUNNEL_URL="$(sudo cat /opt/silence/tunnel_url 2>/dev/null || true)"
+        if [ -z "$TUNNEL_URL" ]; then
+          TUNNEL_URL="$(sudo journalctl -u silence-tunnel --no-pager 2>/dev/null | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1 || true)"
+        fi
+        if [ -z "$TUNNEL_URL" ]; then
+          echo "[ERROR] No tunnel URL found. Diagnostics:"
+          sudo tail -40 /var/log/silence-install.log 2>/dev/null || true
+          sudo journalctl -u silence-tunnel --no-pager 2>/dev/null | tail -30 || true
+          sudo docker ps -a --format 'table {{.Names}}	{{.Status}}' || true
+          exit 1
+        fi
+        echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+        echo "[SUCCESS] Public URL: $TUNNEL_URL"
+        for ep in "/" "/admin" "/auth/v1/health"; do
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 "http://127.0.0.1:8000$ep" || echo 000)"
+          echo "[HEALTH] $ep -> HTTP $code"
+        done
+        pub="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 "$TUNNEL_URL/" || echo 000)"
+        echo "[HEALTH] public tunnel / -> HTTP $pub"
+        echo "### Silence Gateway is LIVE (Cloudflare Quick Tunnel)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**OPEN SILENCE GATEWAY: $TUNNEL_URL**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Setting | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+        echo "| Public URL | $TUNNEL_URL |" >> $GITHUB_STEP_SUMMARY
+        echo "| Admin Dashboard | $TUNNEL_URL/admin |" >> $GITHUB_STEP_SUMMARY
+        echo "| Admin Email | $ADMIN_EMAIL |" >> $GITHUB_STEP_SUMMARY
+        echo "| Admin Password | (yehi hai jo deploy time pe set kiya tha - logs mein masked) |" >> $GITHUB_STEP_SUMMARY
+        echo "| Gateway API (OpenAI) | $TUNNEL_URL/v1/chat/completions |" >> $GITHUB_STEP_SUMMARY
+        echo "| Gateway API (Anthropic) | $TUNNEL_URL/v1/messages |" >> $GITHUB_STEP_SUMMARY
+        echo "| Server-side creds | /opt/silence/credentials.txt (runner VM pe) |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "API keys (sk-silence-...) admin UI ke Providers section mein banao." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        # FIX (exit code 127 lesson): workflow commands MUST be echoed.
+        # A bare '::notice ...' line is executed by bash as a command -> not found -> 127.
+        echo "::notice title=Silence Gateway is LIVE::$TUNNEL_URL"
+        echo "[DONE] Public summary published"
+
+    - name: Keep Alive Monitor (up to ~5.3 hours)
+      run: |
+        echo "Silence Gateway session active - tunnel: $TUNNEL_URL"
+        echo "Containers + tunnel service stay alive while this job runs."
+        for i in {320..1}; do
+            sleep 60
+        done
